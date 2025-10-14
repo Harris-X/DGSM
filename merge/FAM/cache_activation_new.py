@@ -25,7 +25,10 @@ Example:
     --module-regex "mlp\\.|self_attn\\.|down_proj|up_proj|gate_proj|q_proj|k_proj|v_proj|o_proj|dense|fc|ffn" \
     --probe-batch-size 1\
     --vlm-device-map auto \
-    --vlm-dtype float16
+    --vlm-dtype float16\
+    --tlinp-enable \
+    --vlm-logits-attempt \
+    --fai-compute
 
 Notes:
 - Only local torch models are supported (API models cannot be hooked).
@@ -233,6 +236,18 @@ def parse_args() -> argparse.Namespace:
                         help="Mutual dependence measure for FAI: sklearn mutual_info_regression (mi), Pearson |r|, or Spearman |rho|.")
     parser.add_argument("--fai-eps", type=float, default=1e-6,
                         help="Stability epsilon used in denominator of FAI formula.")
+
+    # TLINP (Token-Length Invariant Neuron Profiling) knobs (Stage1 of FAM)
+    parser.add_argument("--tlinp-enable", action="store_true",
+                        help="Enable Token-Length Invariant Neuron Profiling: use probability-loss weighted token aggregation instead of plain mean (LLM path only for now).")
+    parser.add_argument("--tlinp-alpha", type=float, default=0.5,
+                        help="Alpha hyper-parameter controlling loss penalty strength in w_t = p_t * exp(-alpha * L_virt_t / max(L_virt)).")
+    parser.add_argument("--tlinp-eps", type=float, default=1e-6,
+                        help="Numerical epsilon for TLINP weight normalization.")
+    parser.add_argument("--tlinp-max-length", type=int, default=None,
+                        help="Optional cap on effective sequence length for TLINP weighting (truncate weights to this length after computing).")
+    parser.add_argument("--vlm-logits-attempt", action="store_true",
+                        help="(Experimental) When using --model (VLM) with --tlinp-enable, attempt two-pass generation to capture prefill logits for true TLINP token weights instead of macro fallback.")
 
     return parser.parse_args()
 
@@ -662,8 +677,14 @@ def _pick_llm_input_device(model: nn.Module) -> torch.device:
 # Hook function (input/output sum & average)
 # -------------------------
 
-def get_hook_with_kwargs(name: str, req_act: Iterable[str], activation_stats: dict):
+TLINP_CONTEXT: Dict[str, Any] = {"token_weights": None}  # Global batch-scoped weights set before hooked forward when TLINP enabled
+
+
+def get_hook_with_kwargs(name: str, req_act: Iterable[str], activation_stats: dict, *, tlinp: bool = False):
     def hook_fn(module, args, kwargs, output):
+        # For VLM two-pass TLINP: skip accumulation during first capture pass
+        if tlinp and TLINP_CONTEXT.get("vlm_pending_weight_pass"):
+            return
         # Lazy init extended sample buffers (for FAI)
         if "input_batches" not in activation_stats[name]:
             activation_stats[name]["input_batches"] = []
@@ -699,40 +720,181 @@ def get_hook_with_kwargs(name: str, req_act: Iterable[str], activation_stats: di
         if "output" in req_act:
             out_tensor = output[0] if isinstance(output, tuple) else output
             if isinstance(out_tensor, torch.Tensor):
-                t_float = out_tensor.detach().cpu().float()
-                try:
-                    t_reshaped = t_float.reshape(-1, t_float.shape[-1])
-                except Exception:
-                    return
-                current_sum = torch.sum(t_reshaped, dim=0)
-                if activation_stats[name]["output_sum"] is None:
-                    activation_stats[name]["output_sum"] = current_sum
+                # TLINP weighting path: expect shape [B, T, H]
+                if tlinp and out_tensor.dim() == 3 and TLINP_CONTEXT.get("token_weights") is not None:
+                    weights = TLINP_CONTEXT["token_weights"]  # shape [B, T]
+                    try:
+                        # Align shapes (truncate if mismatch due to generation difference)
+                        B, T, H = out_tensor.shape
+                        w = weights
+                        if w.shape[0] != B:
+                            # fallback: ignore weighting for this module
+                            raise ValueError("Batch size mismatch in TLINP weights")
+                        if w.shape[1] < T:
+                            # pad last weight with last value
+                            pad_len = T - w.shape[1]
+                            w = torch.cat([w, w[:, -1:].expand(B, pad_len)], dim=1)
+                        elif w.shape[1] > T:
+                            w = w[:, :T]
+                        # weighted sum over token dimension
+                        w_exp = w.unsqueeze(-1)  # [B,T,1]
+                        out_cpu = out_tensor.detach().to("cpu", non_blocking=True).float()
+                        weighted_sum = (out_cpu * w_exp).sum(dim=1)  # [B,H]
+                        weight_total = w.sum()  # scalar
+                        current_sum = weighted_sum.sum(dim=0)  # aggregate across batch
+                        if activation_stats[name]["output_sum"] is None:
+                            activation_stats[name]["output_sum"] = current_sum
+                            activation_stats[name]["output_weight_total"] = float(weight_total.item())
+                        else:
+                            activation_stats[name]["output_sum"] += current_sum
+                            activation_stats[name]["output_weight_total"] += float(weight_total.item())
+                        # store per-sample weighted representations for FAI (each row is already weighted sum over tokens)
+                        activation_stats[name]["output_batches"].append(weighted_sum)
+                    except Exception:
+                        # Fallback to original unweighted accumulation
+                        t_float = out_tensor.detach().cpu().float()
+                        try:
+                            t_reshaped = t_float.reshape(-1, t_float.shape[-1])
+                        except Exception:
+                            return
+                        current_sum = torch.sum(t_reshaped, dim=0)
+                        if activation_stats[name]["output_sum"] is None:
+                            activation_stats[name]["output_sum"] = current_sum
+                        else:
+                            activation_stats[name]["output_sum"] += current_sum
+                        activation_stats[name]["output_tokens"] += t_reshaped.shape[0]
+                        bh = _to_bh(out_tensor)
+                        if bh is not None:
+                            activation_stats[name]["output_batches"].append(bh)
+                elif tlinp and out_tensor.dim() == 3:
+                    # VLM TLINP fallback: macro-average per sample (equal token weights)
+                    try:
+                        B, T, H = out_tensor.shape
+                        out_cpu = out_tensor.detach().to("cpu", non_blocking=True).float()
+                        sample_means = out_cpu.mean(dim=1)  # [B,H]
+                        batch_sum = sample_means.sum(dim=0)
+                        if activation_stats[name]["output_macro_sum"] is None:
+                            activation_stats[name]["output_macro_sum"] = batch_sum
+                        else:
+                            activation_stats[name]["output_macro_sum"] += batch_sum
+                        activation_stats[name]["output_macro_count"] += B
+                        activation_stats[name]["output_batches"].append(sample_means)
+                    except Exception:
+                        t_float = out_tensor.detach().cpu().float()
+                        try:
+                            t_reshaped = t_float.reshape(-1, t_float.shape[-1])
+                        except Exception:
+                            return
+                        current_sum = torch.sum(t_reshaped, dim=0)
+                        if activation_stats[name]["output_sum"] is None:
+                            activation_stats[name]["output_sum"] = current_sum
+                        else:
+                            activation_stats[name]["output_sum"] += current_sum
+                        activation_stats[name]["output_tokens"] += t_reshaped.shape[0]
+                        bh = _to_bh(out_tensor)
+                        if bh is not None:
+                            activation_stats[name]["output_batches"].append(bh)
                 else:
-                    activation_stats[name]["output_sum"] += current_sum
-                activation_stats[name]["output_tokens"] += t_reshaped.shape[0]
-                # store per-sample pooled batch rows for FAI
-                bh = _to_bh(out_tensor)
-                if bh is not None:
-                    activation_stats[name]["output_batches"].append(bh)
+                    t_float = out_tensor.detach().cpu().float()
+                    try:
+                        t_reshaped = t_float.reshape(-1, t_float.shape[-1])
+                    except Exception:
+                        return
+                    current_sum = torch.sum(t_reshaped, dim=0)
+                    if activation_stats[name]["output_sum"] is None:
+                        activation_stats[name]["output_sum"] = current_sum
+                    else:
+                        activation_stats[name]["output_sum"] += current_sum
+                    activation_stats[name]["output_tokens"] += t_reshaped.shape[0]
+                    bh = _to_bh(out_tensor)
+                    if bh is not None:
+                        activation_stats[name]["output_batches"].append(bh)
         # Input
         if "input" in req_act:
             in_tensor = kwargs.get("hidden_states", args[0] if (args and isinstance(args[0], torch.Tensor)) else None)
             if isinstance(in_tensor, torch.Tensor):
-                t_float = in_tensor.detach().cpu().float()
-                try:
-                    t_reshaped = t_float.reshape(-1, t_float.shape[-1])
-                except Exception:
-                    return
-                current_sum = torch.sum(t_reshaped, dim=0)
-                if activation_stats[name]["input_sum"] is None:
-                    activation_stats[name]["input_sum"] = current_sum
+                if tlinp and in_tensor.dim() == 3 and TLINP_CONTEXT.get("token_weights") is not None:
+                    weights = TLINP_CONTEXT["token_weights"]
+                    try:
+                        B, T, H = in_tensor.shape
+                        w = weights
+                        if w.shape[0] != B:
+                            raise ValueError("Batch size mismatch in TLINP weights (input)")
+                        if w.shape[1] < T:
+                            pad_len = T - w.shape[1]
+                            w = torch.cat([w, w[:, -1:].expand(B, pad_len)], dim=1)
+                        elif w.shape[1] > T:
+                            w = w[:, :T]
+                        w_exp = w.unsqueeze(-1)
+                        in_cpu = in_tensor.detach().to("cpu", non_blocking=True).float()
+                        weighted_sum = (in_cpu * w_exp).sum(dim=1)
+                        weight_total = w.sum()
+                        current_sum = weighted_sum.sum(dim=0)
+                        if activation_stats[name]["input_sum"] is None:
+                            activation_stats[name]["input_sum"] = current_sum
+                            activation_stats[name]["input_weight_total"] = float(weight_total.item())
+                        else:
+                            activation_stats[name]["input_sum"] += current_sum
+                            activation_stats[name]["input_weight_total"] += float(weight_total.item())
+                        activation_stats[name]["input_batches"].append(weighted_sum)
+                    except Exception:
+                        t_float = in_tensor.detach().cpu().float()
+                        try:
+                            t_reshaped = t_float.reshape(-1, t_float.shape[-1])
+                        except Exception:
+                            return
+                        current_sum = torch.sum(t_reshaped, dim=0)
+                        if activation_stats[name]["input_sum"] is None:
+                            activation_stats[name]["input_sum"] = current_sum
+                        else:
+                            activation_stats[name]["input_sum"] += current_sum
+                        activation_stats[name]["input_tokens"] += t_reshaped.shape[0]
+                        bh = _to_bh(in_tensor)
+                        if bh is not None:
+                            activation_stats[name]["input_batches"].append(bh)
+                elif tlinp and in_tensor.dim() == 3:
+                    # VLM TLINP fallback: macro-average input tokens per sample
+                    try:
+                        B, T, H = in_tensor.shape
+                        in_cpu = in_tensor.detach().to("cpu", non_blocking=True).float()
+                        sample_means = in_cpu.mean(dim=1)
+                        batch_sum = sample_means.sum(dim=0)
+                        if activation_stats[name]["input_macro_sum"] is None:
+                            activation_stats[name]["input_macro_sum"] = batch_sum
+                        else:
+                            activation_stats[name]["input_macro_sum"] += batch_sum
+                        activation_stats[name]["input_macro_count"] += B
+                        activation_stats[name]["input_batches"].append(sample_means)
+                    except Exception:
+                        t_float = in_tensor.detach().cpu().float()
+                        try:
+                            t_reshaped = t_float.reshape(-1, t_float.shape[-1])
+                        except Exception:
+                            return
+                        current_sum = torch.sum(t_reshaped, dim=0)
+                        if activation_stats[name]["input_sum"] is None:
+                            activation_stats[name]["input_sum"] = current_sum
+                        else:
+                            activation_stats[name]["input_sum"] += current_sum
+                        activation_stats[name]["input_tokens"] += t_reshaped.shape[0]
+                        bh = _to_bh(in_tensor)
+                        if bh is not None:
+                            activation_stats[name]["input_batches"].append(bh)
                 else:
-                    activation_stats[name]["input_sum"] += current_sum
-                activation_stats[name]["input_tokens"] += t_reshaped.shape[0]
-                # store per-sample pooled batch rows for FAI
-                bh = _to_bh(in_tensor)
-                if bh is not None:
-                    activation_stats[name]["input_batches"].append(bh)
+                    t_float = in_tensor.detach().cpu().float()
+                    try:
+                        t_reshaped = t_float.reshape(-1, t_float.shape[-1])
+                    except Exception:
+                        return
+                    current_sum = torch.sum(t_reshaped, dim=0)
+                    if activation_stats[name]["input_sum"] is None:
+                        activation_stats[name]["input_sum"] = current_sum
+                    else:
+                        activation_stats[name]["input_sum"] += current_sum
+                    activation_stats[name]["input_tokens"] += t_reshaped.shape[0]
+                    bh = _to_bh(in_tensor)
+                    if bh is not None:
+                        activation_stats[name]["input_batches"].append(bh)
     return hook_fn
 
 
@@ -972,16 +1134,49 @@ def main():
         raise RuntimeError("No modules matched given --module-regex/--include-types/--exclude-regex filters.")
 
     activation_stats = defaultdict(lambda: {
+        # Raw token-sum accumulators
         "input_sum": None, "input_tokens": 0,
-        "output_sum": None, "output_tokens": 0
+        "output_sum": None, "output_tokens": 0,
+        # Weighted denominators when true TLINP token weights are used (LLM path)
+        "input_weight_total": 0.0, "output_weight_total": 0.0,
+        # Macro-average fallback accumulators (VLM path or when no logits): sum of per-sample means & count
+        "input_macro_sum": None, "input_macro_count": 0,
+        "output_macro_sum": None, "output_macro_count": 0
     })
 
     hooks = [
         module.register_forward_hook(
-            get_hook_with_kwargs(name, args.req_act, activation_stats), with_kwargs=True
+            get_hook_with_kwargs(name, args.req_act, activation_stats, tlinp=args.tlinp_enable), with_kwargs=True
         )
         for name, module in target_modules.items()
     ]
+
+    # (Experimental) VLM vocab head hook to capture prefill logits for TLINP weighting
+    vlm_logits_hook = None
+    if (not use_hf_llm) and args.tlinp_enable and getattr(args, 'vlm_logits_attempt', False):
+        vocab_head: Optional[nn.Module] = None
+        try:
+            for nm, m in base_module.named_modules():  # type: ignore
+                if isinstance(m, nn.Linear) and m.out_features >= 8192:
+                    if nm.endswith('lm_head') or nm.endswith('output') or 'lm_head' in nm:
+                        vocab_head = m
+                        break
+            if vocab_head is None and args.verbose:
+                print("[VLM-TLINP] Could not auto-detect vocab head; skipping true token weighting.")
+        except Exception as e:
+            if args.verbose:
+                print(f"[VLM-TLINP] vocab head scan failed: {type(e).__name__}: {e}")
+        if vocab_head is not None:
+            def _capture_logits(mod, a, k, out):
+                try:
+                    if TLINP_CONTEXT.get('vlm_prefill_captured'):
+                        return
+                    if torch.is_tensor(out) and out.dim() == 3 and out.size(1) > 1:  # [B,T,V]
+                        TLINP_CONTEXT['vlm_prefill_logits'] = out.detach().cpu()
+                        TLINP_CONTEXT['vlm_prefill_captured'] = True
+                except Exception as ce:
+                    warnings.warn(f"[VLM-TLINP] Logits capture failed: {type(ce).__name__}: {ce}")
+            vlm_logits_hook = vocab_head.register_forward_hook(_capture_logits)
 
     # -------- Run forwards to collect activations --------
     processed = 0
@@ -1000,6 +1195,12 @@ def main():
         if tokenizer.pad_token_id is None and hasattr(tokenizer, "eos_token") and tokenizer.eos_token is not None:
             tokenizer.pad_token = tokenizer.eos_token
         bsz = max(1, int(args.probe_batch_size))
+        # If TLINP enabled, we force forward mode (not generate) for reliable token logits
+        if args.tlinp_enable and args.llm_forward_mode != "forward":
+            if args.verbose:
+                print("[TLINP] Forcing --llm-forward-mode=forward to obtain logits for weighting.")
+            args.llm_forward_mode = "forward"
+
         for i in tqdm(range(0, len(texts_for_llm), bsz), desc=f"Forward LLM on {dataset_id}"):
             batch_texts = texts_for_llm[i:i+bsz]
             enc = tokenizer(
@@ -1015,8 +1216,7 @@ def main():
             target_dev = _pick_llm_input_device(model) if device_map is not None and not (isinstance(device_map, str) and device_map.lower() == "none") else device
             enc = {k: v.to(target_dev) for k, v in enc.items()}
             try:
-                if args.llm_forward_mode == "generate":
-                    # 与 VLM 一致：走生成路径，触发与 VLM 相同位置的模块前向（prefill + 1 step 解码）
+                if args.llm_forward_mode == "generate" and not args.tlinp_enable:
                     _ = model.generate(
                         input_ids=enc.get("input_ids"),
                         attention_mask=enc.get("attention_mask"),
@@ -1026,8 +1226,37 @@ def main():
                         use_cache=True,
                     )
                 else:
-                    # 直接前向：较快，但与 VLM generate 略有差异
-                    _ = model(**enc, use_cache=False)
+                    # Forward pass with logits for TLINP or explicit forward mode
+                    # Two-pass not needed: we compute logits and hooks run earlier without weights; thus we perform a second pass only if TLINP enabled.
+                    out = model(**enc, use_cache=False, output_hidden_states=False, return_dict=True)
+                    if args.tlinp_enable:
+                        with torch.no_grad():
+                            logits = out.logits  # [B, T, V]
+                            # Compute w_t
+                            # log_probs -> probabilities
+                            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+                            probs = log_probs.exp()  # [B,T,V]
+                            # token confidence p_t: max probability per position
+                            p_t, _ = probs.max(dim=-1)  # [B,T]
+                            # virtual loss L_virt_t = - mean_v log p_{t,v} = - (1/V) * sum log_probs
+                            mean_log_p = log_probs.mean(dim=-1)  # [B,T]
+                            L_virt = - mean_log_p  # [B,T]
+                            # Optional length cap
+                            if args.tlinp_max_length is not None and L_virt.shape[1] > args.tlinp_max_length:
+                                L_virt = L_virt[:, :args.tlinp_max_length]
+                                p_t = p_t[:, :args.tlinp_max_length]
+                            max_L = torch.clamp(L_virt.max(dim=1, keepdim=True).values, min=1e-12)
+                            alpha = float(args.tlinp_alpha)
+                            weights = p_t * torch.exp(- alpha * (L_virt / max_L))  # [B,T]
+                            # Normalize per sequence to avoid scale explosion; keep sum for denominator separately
+                            seq_sums = weights.sum(dim=1, keepdim=True).clamp_min(args.tlinp_eps)
+                            weights_norm = weights / seq_sums
+                            # Store in global context for second weighted pass
+                            TLINP_CONTEXT["token_weights"] = weights_norm.detach().to("cpu")  # keep on cpu to reduce GPU mem
+                        # Second pass with hooks using TLINP_CONTEXT weights
+                        out2 = model(**enc, use_cache=False, output_hidden_states=False, return_dict=True)
+                        # Clear weights after use to prevent leaking across batches
+                        TLINP_CONTEXT["token_weights"] = None
             except RuntimeError as err:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -1040,24 +1269,87 @@ def main():
                 torch.cuda.empty_cache()
             processed += len(batch_texts)
     else:
-        # Original: drive forwards via vlm.generate on multi-modal messages
+        # VLM path
         for struct in tqdm(messages, desc=f"Forward {args.model} on {dataset_id}"):
-            if os.environ.get('SKIP_ERR', '0') == '1':
+            if args.tlinp_enable and getattr(args, 'vlm_logits_attempt', False):
+                # First pass: capture logits only
+                TLINP_CONTEXT['vlm_pending_weight_pass'] = True
+                TLINP_CONTEXT['vlm_prefill_captured'] = False
+                TLINP_CONTEXT['vlm_prefill_logits'] = None
                 try:
                     _ = vlm.generate(message=struct, dataset=dataset_id)
                 except RuntimeError as err:
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
-                    warnings.warn(f"generation failed: {type(err).__name__}: {err}")
-                    err_count += 1
+                    if os.environ.get('SKIP_ERR', '0') == '1':
+                        warnings.warn(f"generation (capture) failed: {type(err).__name__}: {err}")
+                        err_count += 1
+                        TLINP_CONTEXT.pop('vlm_pending_weight_pass', None)
+                        TLINP_CONTEXT.pop('vlm_prefill_logits', None)
+                        TLINP_CONTEXT.pop('vlm_prefill_captured', None)
+                        continue
+                    else:
+                        raise
+                # Compute weights if logits captured
+                weights_norm = None
+                if TLINP_CONTEXT.get('vlm_prefill_captured') and TLINP_CONTEXT.get('vlm_prefill_logits') is not None:
+                    try:
+                        logits = TLINP_CONTEXT['vlm_prefill_logits']  # [B,T,V] cpu
+                        log_probs = torch.log_softmax(logits.float(), dim=-1)
+                        probs = log_probs.exp()
+                        p_t, _ = probs.max(dim=-1)  # [B,T]
+                        mean_log_p = log_probs.mean(dim=-1)
+                        L_virt = - mean_log_p
+                        if args.tlinp_max_length is not None and L_virt.shape[1] > args.tlinp_max_length:
+                            L_virt = L_virt[:, :args.tlinp_max_length]
+                            p_t = p_t[:, :args.tlinp_max_length]
+                        max_L = torch.clamp(L_virt.max(dim=1, keepdim=True).values, min=1e-12)
+                        alpha = float(args.tlinp_alpha)
+                        weights = p_t * torch.exp(- alpha * (L_virt / max_L))
+                        seq_sums = weights.sum(dim=1, keepdim=True).clamp_min(args.tlinp_eps)
+                        weights_norm = (weights / seq_sums).to(torch.float32)
+                    except Exception as we:
+                        if args.verbose:
+                            warnings.warn(f"[VLM-TLINP] weight compute failed, fallback macro: {type(we).__name__}: {we}")
+                        weights_norm = None
+                # Second pass: accumulation (remove pending flag, set token weights if available)
+                TLINP_CONTEXT['vlm_pending_weight_pass'] = False
+                if weights_norm is not None:
+                    TLINP_CONTEXT['token_weights'] = weights_norm
+                try:
+                    _ = vlm.generate(message=struct, dataset=dataset_id)
+                except RuntimeError as err:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    if os.environ.get('SKIP_ERR', '0') == '1':
+                        warnings.warn(f"generation (weighted) failed: {type(err).__name__}: {err}")
+                        err_count += 1
+                    else:
+                        raise
+                # Clear TLINP context for next sample
+                TLINP_CONTEXT['token_weights'] = None
+                TLINP_CONTEXT.pop('vlm_prefill_logits', None)
+                TLINP_CONTEXT.pop('vlm_prefill_captured', None)
             else:
-                _ = vlm.generate(message=struct, dataset=dataset_id)
+                # Single pass original behavior
+                if os.environ.get('SKIP_ERR', '0') == '1':
+                    try:
+                        _ = vlm.generate(message=struct, dataset=dataset_id)
+                    except RuntimeError as err:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        warnings.warn(f"generation failed: {type(err).__name__}: {err}")
+                        err_count += 1
+                else:
+                    _ = vlm.generate(message=struct, dataset=dataset_id)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             processed += 1
 
     for h in hooks:
         h.remove()
+    if 'vlm_logits_hook' in locals() and vlm_logits_hook is not None:
+        vlm_logits_hook.remove()
 
     if args.verbose:
         print(f"Processed samples: {processed}, errors: {err_count}")
@@ -1165,7 +1457,9 @@ def main():
         eps = float(getattr(args, "fai_eps", 1e-6))
         fai_mode = str(getattr(args, "fai_mi_mode", "mi"))
 
-        for name, stats in activation_stats.items():
+        # Progress over modules for FAI computation
+        _mods = list(activation_stats.items())
+        for name, stats in tqdm(_mods, desc="Compute FAI", total=len(_mods)):
             X_mat = _cap_cat(stats.get("input_batches", []), cap)
             Y_mat = _cap_cat(stats.get("output_batches", []), cap)
             if Y_mat is None or Y_mat.numel() == 0:
@@ -1197,10 +1491,25 @@ def main():
     averaged_activations: Dict[str, Dict[str, torch.Tensor]] = {}
     for name, stats in activation_stats.items():
         averaged_activations[name] = {}
-        if stats["input_sum"] is not None and stats["input_tokens"] > 0:
-            averaged_activations[name]["input"] = stats["input_sum"] / stats["input_tokens"]
-        if stats["output_sum"] is not None and stats["output_tokens"] > 0:
-            averaged_activations[name]["output"] = stats["output_sum"] / stats["output_tokens"]
+        # Prefer TLINP weighted denominator if available
+        if stats["input_sum"] is not None:
+            denom_in = stats.get("input_weight_total", None)
+            if denom_in is not None and denom_in > 0:
+                averaged_activations[name]["input"] = stats["input_sum"] / denom_in
+            elif stats.get("input_tokens", 0) > 0:
+                averaged_activations[name]["input"] = stats["input_sum"] / stats["input_tokens"]
+        # Macro-average fallback (VLM TLINP)
+        if "input" not in averaged_activations[name] and stats.get("input_macro_sum") is not None and stats.get("input_macro_count", 0) > 0:
+            averaged_activations[name]["input"] = stats["input_macro_sum"] / max(1, stats["input_macro_count"])
+        if stats["output_sum"] is not None:
+            denom_out = stats.get("output_weight_total", None)
+            if denom_out is not None and denom_out > 0:
+                averaged_activations[name]["output"] = stats["output_sum"] / denom_out
+            elif stats.get("output_tokens", 0) > 0:
+                averaged_activations[name]["output"] = stats["output_sum"] / stats["output_tokens"]
+        # Macro-average fallback (VLM TLINP)
+        if "output" not in averaged_activations[name] and stats.get("output_macro_sum") is not None and stats.get("output_macro_count", 0) > 0:
+            averaged_activations[name]["output"] = stats["output_macro_sum"] / max(1, stats["output_macro_count"])
         # attach FAI vectors if computed for this module
         if getattr(args, "fai_compute", False) and name in fai_results:
             averaged_activations[name]["fai"] = fai_results[name]["fai"]

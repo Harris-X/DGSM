@@ -248,7 +248,20 @@ def _diagnose_lambda(costs, args):
 def stage2(args: argparse.Namespace):
     print("\n--- [DGSM Stage-2: Dynamic Gromov Subspace Mapping + GWD Alignment] ---")
     subsA=_load_subspaces(args.subs_a); subsB=_load_subspaces(args.subs_b)
-    modules=sorted(set(subsA.keys()) & set(subsB.keys()))
+    # 诊断：检查 A/B 子空间键的交并情况，避免因为前缀不同造成遗漏
+    keysA=set(subsA.keys()); keysB=set(subsB.keys())
+    inter=sorted(keysA & keysB)
+    onlyA=sorted(keysA - keysB)
+    onlyB=sorted(keysB - keysA)
+    if onlyA or onlyB:
+        print(f"[Stage-2][Warn] A/B 子空间键不完全一致: A={len(keysA)} B={len(keysB)} 交集={len(inter)} A-Only={len(onlyA)} B-Only={len(onlyB)}")
+        # 打印前若干个以便快速定位（避免刷屏）
+        if onlyA:
+            print("  [Only in A] 示例:", onlyA[:10])
+        if onlyB:
+            print("  [Only in B] 示例:", onlyB[:10])
+        print("  提示: Stage-1 已对键名规范化为 'model.layers.*'，若仍有不一致，请检查 Stage-1 need_merge/规范化逻辑或 rank 设置。")
+    modules=inter
     device=torch.device('cuda' if torch.cuda.is_available() and not args.cpu else 'cpu')
     # 统一 POT 开关，避免后面 meta 中取最后一次循环的局部变量
     pot_enabled_global = (((getattr(args, 'pot', 'auto') != 'off') and _HAVE_POT) or getattr(args, 'use_pot', False))

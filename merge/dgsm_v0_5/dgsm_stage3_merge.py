@@ -80,8 +80,11 @@ def _compute_tfi(S: torch.Tensor, psi: torch.Tensor) -> Tuple[torch.Tensor, torc
     bar_h = float(psi[1]) if psi.numel() >= 2 else float(-(p * (p.clamp_min(EPS).log())).sum().item())
     bar_d = float(psi[2]) if psi.numel() >= 3 else 0.0
     denom = bar_h + EPS
-    tfi_base = max(0.0, bar_s * (1.0 - bar_d))
+    # tfi_base = max(0.0, bar_s * (1.0 - bar_d))
+    tfi_base = abs(bar_s * bar_d)
+    print("bar_s, bar_h, bar_d", bar_s, bar_h, bar_d)
     tfi = p * (tfi_base / denom)
+    print("tfi", tfi)
     return tfi, p, bar_d, bar_h, bar_s
 
 

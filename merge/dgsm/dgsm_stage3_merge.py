@@ -107,6 +107,7 @@ def dgsm_merge(args: argparse.Namespace):
     if base_subs is not None:
         print(f"[Info] Reusing Stage-1 base subspaces: {len(base_subs)} entries")
     merged=weights_A.copy(); stat_layers=stat_used=0
+    missing_in_B=0; missing_examples=[]
     reuse_ok=reuse_fail=svd_fallback=0
     for k in tqdm(list(weights_A.keys()), desc='DGSM Merge'):
         if not need_merge(k): continue
@@ -116,6 +117,9 @@ def dgsm_merge(args: argparse.Namespace):
             if W_B is None:
                 alt_k = _alt_donor_key(weights_B, k)
                 if alt_k is None:
+                    missing_in_B += 1
+                    if len(missing_examples) < 10:
+                        missing_examples.append(k)
                     continue
                 W_B = weights_B[alt_k]
             W_B=W_B.float(); stat_layers+=1
@@ -190,6 +194,8 @@ def dgsm_merge(args: argparse.Namespace):
     out_root=osp.join(args.output_dir, base_dir, 'dgsm_merged'); os.makedirs(out_root, exist_ok=True)
     with open(osp.join(out_root,'merge_meta_dgsm.json'),'w') as f: json.dump(meta,f,indent=2)
     print(f"[Done] DGSM merge complete: layers={stat_layers}, used={stat_used}, reuse_U={reuse_ok}, svd_fallback={svd_fallback}, reuse_fail={reuse_fail}")
+    if missing_in_B>0:
+        print(f"  [Warn] {missing_in_B} 处权重在 donor 中未找到（已跳过）。示例: {missing_examples}")
 
 
 def parse_args():

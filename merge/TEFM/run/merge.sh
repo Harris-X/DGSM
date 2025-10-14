@@ -1,0 +1,13 @@
+python merge/TEFM/tefm_stage3_merge.py \
+  --base-model /root/autodl-tmp/AdaMMS/downloaded_models/mplug-owl2-llama2-7b \
+  --donor-model /root/autodl-tmp/AdaMMS/downloaded_models/llava-v1.5-7b \
+  --stage2 activations/tefm_stage2_mPLUG-Owl2_TO_llava_v1.5_7b.pt \
+  --acts-base activations/mPLUG-Owl2_meta.pt \
+  --acts-donor activations/llava_v1.5_7b_meta.pt \
+  --base-lape activations/mPLUG-Owl2_meta_lape.pt \
+  --donor-lape activations/llava_v1.5_7b_meta_lape.pt \
+  --output-dir merged_models_stage3 \
+  --lambda-proj 1.0 --lambda-ortho 0.8 \
+  --beta-flat 0.5 --beta-h 0.1 --use-curv-exp \
+  --alpha-conflict 2.0 \
+  --pair-mode round_robin

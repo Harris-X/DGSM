@@ -29,9 +29,16 @@ GSF-TEFM Stage-3: Subspace-Gromov Fusion Merge
   - 使用 GWD cost 作为子空间距离；较小 cost 表示更可信的对齐 -> 更大 λ。
   - 投影部分注入“共享功能”差分，正交部分衰减注入以避免噪声。
 
+扩展 (2025-09-27):
+    - 支持可选 Stage-2b 行级 / 组级 λ (row_lambda) 对 τ_proj 进行逐行缩放:
+             若提供 --stage2b 文件且包含对应模块 row_lambda:
+                    τ_proj_scaled[i,:] = row_lambda[i] * τ_proj[i,:]
+                    最终: W_new = W_A + τ_proj_scaled * λ + τ_ortho * (λ * ortho_scale)
+        作用: 更细粒度注入保留高贡献神经元，抑制低贡献噪声。
+
 输出：
-  - safetensors / bin 与原格式一致的合并模型权重
-  - merge_meta_gsf.json 记录超参数与统计
+    - safetensors / bin 与原格式一致的合并模型权重
+    - merge_meta_gsf.json 记录超参数与统计 (新增 row_lambda_used)
 """
 from __future__ import annotations
 import argparse
@@ -40,7 +47,7 @@ import math
 import os
 import os.path as osp
 from collections import defaultdict
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import safetensors
@@ -151,10 +158,19 @@ def gsf_merge(args: argparse.Namespace):
     weights_B = load_weights(args.donor_model)
     stage2 = torch.load(args.stage2, map_location='cpu')
     modules_info = stage2.get('modules', stage2)
+    stage2b = None
+    if args.stage2b is not None and os.path.exists(args.stage2b):
+        try:
+            obj2b = torch.load(args.stage2b, map_location='cpu')
+            stage2b = obj2b.get('modules', obj2b)
+            print(f"[Info] Loaded Stage-2b group localization: {args.stage2b}")
+        except Exception as e:
+            print(f"[Warn] Failed loading stage2b ({e}); ignore row-level λ")
 
     merged = weights_A.copy()
     stat_layers = 0
     stat_used = 0
+    stat_row_used = 0
 
     for k in tqdm(list(weights_A.keys()), desc='GSF Merge'):
         if not need_merge(k):
@@ -187,6 +203,14 @@ def gsf_merge(args: argparse.Namespace):
                 tau = W_B - W_A
                 tau_proj = U_A @ (U_A.T @ tau)
                 tau_ortho = tau - tau_proj
+                # 行级 λ (可选)
+                if stage2b is not None:
+                    blk2b = stage2b.get(mod_name)
+                    if blk2b is not None and 'row_lambda' in blk2b:
+                        row_lambda = blk2b['row_lambda'].float().to(tau_proj.device)
+                        if row_lambda.shape[0] == tau_proj.shape[0]:
+                            tau_proj = row_lambda.unsqueeze(1) * tau_proj
+                            stat_row_used += 1
                 W_new = W_A + lam * tau_proj + (lam * ortho_scale) * tau_ortho
                 merged[k] = W_new.to(weights_A[k].dtype)
                 stat_used += 1
@@ -209,6 +233,7 @@ def gsf_merge(args: argparse.Namespace):
         base_model=args.base_model,
         donor_model=args.donor_model,
         stage2=args.stage2,
+        stage2b=args.stage2b,
         cost_scale=float(args.cost_scale),
         gamma=float(args.gamma),
         ortho_scale=float(args.ortho_scale),
@@ -216,6 +241,7 @@ def gsf_merge(args: argparse.Namespace):
         bias_alpha=float(args.bias_alpha),
         stat_layers=stat_layers,
         stat_used=stat_used,
+        stat_row_lambda_used=stat_row_used,
     )
     base_dir = osp.basename(args.base_model.rstrip(os.sep))
     out_root = osp.join(args.output_dir, base_dir, 'gsf_merged')
@@ -230,6 +256,7 @@ def parse_args():
     ap.add_argument('--base-model', type=str, required=True)
     ap.add_argument('--donor-model', type=str, required=True)
     ap.add_argument('--stage2', type=str, required=True)
+    ap.add_argument('--stage2b', type=str, default=None, help='可选：Stage-2b 行/组 λ 文件')
     ap.add_argument('--output-dir', type=str, required=True)
     # λ & cost 调节
     ap.add_argument('--cost-scale', type=float, default=1.0, help='GWD cost 归一化尺度 (cost/cost_scale)')

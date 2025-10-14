@@ -1,5 +1,5 @@
 import torch
-pkg = torch.load("activations/gsf_stage2_mplug_TO_llava.pt", map_location="cpu")
+pkg = torch.load("/root/autodl-tmp/AdaMMS/activations/dgsm_stage1_base.pt", map_location="cpu")
 # acts = pkg["activations"]
 # meta = pkg["meta"]
 # print(pkg["layers.2"]["input"].shape)

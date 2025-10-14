@@ -195,8 +195,8 @@ if __name__ == "__main__":
     parser.add_argument('--donor_model_path', type=str, default="/root/autodl-tmp/AdaMMS/downloaded_models/llava-v1.5-7b", help="贡献模型B的路径。")
     parser.add_argument('--original_model_path', type=str, default="/root/autodl-tmp/AdaMMS/downloaded_models/Llama-2-7b-hf", help="原始共同祖先模型C的路径。")
     parser.add_argument("--cache_dir", type=str, default="/root/autodl-tmp/AdaMMS/merge/SAFE/activations", help="缓存目录")
-    parser.add_argument("--top_k_ratio", type=float, default=0.1, help="选择的神经元比例")
-    parser.add_argument("--alpha", type=float, default=0.1, help="夏普斯惩罚系数")
+    parser.add_argument("--top_k_ratio", type=float, default=0.2, help="选择的神经元比例")
+    parser.add_argument("--alpha", type=float, default=0.3, help="夏普斯惩罚系数")
     parser.add_argument("--force_recompute", action='store_true', help="强制重新计算掩码")
     args = parser.parse_args()
 
