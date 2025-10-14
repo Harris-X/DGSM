@@ -1,0 +1,1 @@
+bash -lc "GPU=${GPU:-0} TASK_LIST='mmmu_val mme ocrbench' bash run/tune_dgsm_tefm.sh"
