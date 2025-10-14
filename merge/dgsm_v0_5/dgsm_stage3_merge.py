@@ -81,7 +81,7 @@ def _compute_tfi(S: torch.Tensor, psi: torch.Tensor) -> Tuple[torch.Tensor, torc
     bar_d = float(psi[2]) if psi.numel() >= 3 else 0.0
     denom = bar_h + EPS
     # tfi_base = max(0.0, bar_s * (1.0 - bar_d))
-    tfi_base = abs(bar_s * bar_d)
+    tfi_base = bar_s * (1.0 - bar_d)
     print("bar_s, bar_h, bar_d", bar_s, bar_h, bar_d)
     tfi = p * (tfi_base / denom)
     print("tfi", tfi)
@@ -229,9 +229,10 @@ def dgsm_merge(args: argparse.Namespace):
                     S_B = blk['S_B'].float()
                     psi_A = blk['psi_A'].float()
                     psi_B = blk['psi_B'].float()
+                    print("S_A",S_A)
                     tfi, p_A, bar_d, _, _ = _compute_tfi(S_A, psi_A)
                     mask = _select_tfi_mask(tfi, float(getattr(args, 'tfi_threshold', 0.0)), int(getattr(args, 'tfi_topk', 0)))
-
+                    print("tfi",k,tfi)
                     # Mapping: 调整 π*_{k,p} ← π*_{k,p} · TOS_{k,p} / Z，其中 TOS 基于余弦相似和 e^{-β \bar{d}_l}
                     p_B = _softmax_tensor(S_B)
                     bar_d_B = float(psi_B[2]) if psi_B.numel() >= 3 else bar_d
@@ -243,6 +244,7 @@ def dgsm_merge(args: argparse.Namespace):
                     beta = float(getattr(args, 'mapping_beta', 0.1))
                     tos = torch.relu(cos_sim) * math.exp(-beta * bar_d)
                     pi = blk['pi'].float()
+                    print("pi",pi)
                     pi_adj = _normalize_transport((pi * tos).clamp_min(EPS))
                     if M_tensor is not None:
                         pi_effective = M_tensor @ pi_adj
