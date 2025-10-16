@@ -79,6 +79,30 @@ def _entropic_gw_torch(CA: torch.Tensor, CB: torch.Tensor, eps: float, iters: in
 def _load_subspaces(path:str)->Dict[str,Dict[str,torch.Tensor]]:
     obj=torch.load(path,map_location='cpu'); return obj.get('subspaces',obj)
 
+def _strip_multiway_segment(name: str) -> str:
+    """规范化多路 (multiway.*) 模块命名以便与非多路权重对齐。"""
+    if '.multiway.' not in name:
+        return name
+    parts = name.split('.')
+    out = []
+    skip_next = False
+    for part in parts:
+        if skip_next:
+            skip_next = False
+            continue
+        if part == 'multiway':
+            skip_next = True
+            continue
+        out.append(part)
+    return '.'.join(out)
+
+def _group_by_canonical(subspaces: Dict[str, Dict[str, torch.Tensor]]) -> Dict[str, list[str]]:
+    grouped: Dict[str, list[str]] = {}
+    for name in subspaces.keys():
+        canon = _strip_multiway_segment(name)
+        grouped.setdefault(canon, []).append(name)
+    return grouped
+
 def _softmax(x: torch.Tensor, dim=-1):
     x = x - x.max(dim=dim, keepdim=True).values
     return (x.exp() / x.exp().sum(dim=dim, keepdim=True).clamp_min(EPS))
@@ -248,8 +272,9 @@ def _diagnose_lambda(costs, args):
 def stage2(args: argparse.Namespace):
     print("\n--- [DGSM Stage-2: Dynamic Gromov Subspace Mapping + GWD Alignment] ---")
     subsA=_load_subspaces(args.subs_a); subsB=_load_subspaces(args.subs_b)
-    # 诊断：检查 A/B 子空间键的交并情况，避免因为前缀不同造成遗漏
-    keysA=set(subsA.keys()); keysB=set(subsB.keys())
+    groupA=_group_by_canonical(subsA); groupB=_group_by_canonical(subsB)
+    # 诊断：检查 A/B 子空间 canonical 键的交并情况，避免因为 multiway 命名遗漏
+    keysA=set(groupA.keys()); keysB=set(groupB.keys())
     inter=sorted(keysA & keysB)
     onlyA=sorted(keysA - keysB)
     onlyB=sorted(keysB - keysA)
@@ -257,19 +282,29 @@ def stage2(args: argparse.Namespace):
         print(f"[Stage-2][Warn] A/B 子空间键不完全一致: A={len(keysA)} B={len(keysB)} 交集={len(inter)} A-Only={len(onlyA)} B-Only={len(onlyB)}")
         # 打印前若干个以便快速定位（避免刷屏）
         if onlyA:
-            print("  [Only in A] 示例:", onlyA[:10])
+            samples=[(k, groupA[k][:2]) for k in onlyA[:5]]
+            print("  [Only in A] 示例:", samples)
         if onlyB:
-            print("  [Only in B] 示例:", onlyB[:10])
+            samples=[(k, groupB[k][:2]) for k in onlyB[:5]]
+            print("  [Only in B] 示例:", samples)
         print("  提示: Stage-1 已对键名规范化为 'model.layers.*'，若仍有不一致，请检查 Stage-1 need_merge/规范化逻辑或 rank 设置。")
-    modules=inter
+    modules_pairs=[]
+    for canon in inter:
+        base_list=sorted(groupA[canon])
+        donor_list=sorted(groupB[canon])
+        if len(donor_list)==len(base_list):
+            modules_pairs.extend([(b,d,canon) for b,d in zip(base_list, donor_list)])
+        else:
+            donor_name=donor_list[0]
+            modules_pairs.extend([(b, donor_name, canon) for b in base_list])
     device=torch.device('cuda' if torch.cuda.is_available() and not args.cpu else 'cpu')
     # 统一 POT 开关，避免后面 meta 中取最后一次循环的局部变量
     pot_enabled_global = (((getattr(args, 'pot', 'auto') != 'off') and _HAVE_POT) or getattr(args, 'use_pot', False))
     out_mod={}; costs=[]; lambdas=[]
     # 默认显示进度条；可通过 --no-progress 关闭（见 parse_args）
-    it = tqdm(modules, desc='Stage-2 DGSM', disable=bool(getattr(args, 'no_progress', False)))
-    for name in it:
-        blkA,blkB = subsA[name], subsB[name]
+    it = tqdm(modules_pairs, desc='Stage-2 DGSM', disable=bool(getattr(args, 'no_progress', False)))
+    for name, donor_name, canon in it:
+        blkA,blkB = subsA[name], subsB[donor_name]
         UA,SA = blkA['U'].float().to(device), blkA['S'].float().to(device)
         UB,SB = blkB['U'].float().to(device), blkB['S'].float().to(device)
         rA,rB = SA.shape[0], SB.shape[0]
@@ -369,6 +404,8 @@ def stage2(args: argparse.Namespace):
             lam_est = _lambda_from_cost(gwd_cost, args.gamma, args.cost_scale)
             rec['lambda_est'] = torch.tensor(lam_est)
             lambdas.append(lam_est)
+        rec['donor_module']=donor_name
+        rec['canonical_key']=canon
         out_mod[name]=rec; costs.append(gwd_cost)
         if args.verbose:
             src = 'POT' if (args.use_pot and _HAVE_POT) else 'Approx'

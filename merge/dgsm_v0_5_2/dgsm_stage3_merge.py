@@ -39,18 +39,54 @@ def _module_from_param_key(param_key:str)->str:
     if len(parts)>=2: parts=parts[:-1]
     return '.'.join(parts)
 
+def _strip_multiway_segment(name: str) -> str:
+    if '.multiway.' not in name:
+        return name
+    parts = name.split('.')
+    out = []
+    skip_next = False
+    for part in parts:
+        if skip_next:
+            skip_next = False
+            continue
+        if part == 'multiway':
+            skip_next = True
+            continue
+        out.append(part)
+    return '.'.join(out)
+
 def _alt_donor_key(donor:dict, base_key:str)->str | None:
     """在 donor 权重字典里为 base_key 寻找兼容命名的键。
     规则：
       1) 原样匹配 base_key
       2) 尝试在前面加 "language_model." 前缀（OneVision/QwenVL 常见命名）
+      3) 若包含 multiway.* 结构，尝试去除 multiway.<idx>
     命中则返回匹配到的键，否则返回 None
     """
-    if base_key in donor:
-        return base_key
-    alt = f"language_model.{base_key}"
-    if alt in donor:
-        return alt
+    candidates = [base_key]
+    stripped = _strip_multiway_segment(base_key)
+    if stripped != base_key:
+        candidates.append(stripped)
+    # 前缀互换
+    more = []
+    for cand in list(candidates):
+        if cand.startswith('language_model.'):
+            core = cand[len('language_model.') :]
+            more.append(core)
+        else:
+            more.append(f'language_model.{cand}')
+    for cand in more:
+        if cand not in candidates:
+            candidates.append(cand)
+
+    # 去除 multiway 后再拼接 language_model 前缀（避免重复）
+    stripped_lang = _strip_multiway_segment(f'language_model.{base_key}')
+    if stripped_lang not in candidates:
+        candidates.append(stripped_lang)
+
+    for cand in candidates:
+        if cand in donor:
+            return cand
     return None
 
 def _svd_trunc(W:torch.Tensor, r:int):
@@ -174,7 +210,14 @@ def dgsm_merge(args: argparse.Namespace):
     for k in tqdm(list(weights_A.keys()), desc='DGSM Merge'):
         if not need_merge(k): continue
         if k.endswith('.weight') and weights_A[k].ndim==2:
-            mod=_module_from_param_key(k); blk=modules_info.get(mod)
+            mod=_module_from_param_key(k)
+            module_lookup_key = mod
+            blk=modules_info.get(module_lookup_key)
+            if blk is None and '.multiway.' in module_lookup_key:
+                alt_mod = _strip_multiway_segment(module_lookup_key)
+                blk = modules_info.get(alt_mod)
+                if blk is not None:
+                    module_lookup_key = alt_mod
             W_A=weights_A[k].float(); W_B=weights_B.get(k, None)
             if W_B is None:
                 alt_k = _alt_donor_key(weights_B, k)
